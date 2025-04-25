@@ -14,7 +14,7 @@ generation_config = {
     "temperature": 0.0
 }
 
-model_name = "models/gemini-2.5-pro-exp-03-25"
+model_name = "models/gemini-2.5-pro-preview-03-25"
 
 # 必要であればsafetyを設定（今回はなし）
 model = genai.GenerativeModel(
