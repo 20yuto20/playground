@@ -1,35 +1,58 @@
 import os
 import json
 import io
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 import pytesseract
+import re
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# モデルのインスタンス作成
-generation_config = {
-    "temperature": 0.0
-}
-
-model_name = "models/gemini-2.5-pro-exp-03-25"
+model_name = "models/gemini-2.5-pro-preview-03-25"
 
 # 必要であればsafetyを設定（今回はなし）
-model = genai.GenerativeModel(
-    model_name=model_name,
-    generation_config=generation_config,
-    safety_settings=None,
-)
+# model = client.GenerativeModel(
+#     model_name,
+#     generation_config=types.GenerationConfig(temperature=0.2)
+# )
 
 # テキスト位置検出用のシステム指示
 text_detection_system_instructions = """
-    テキストブロックのバウンディングボックスをJSONアレイとして返してください。コードフェンスやマスクは含めないでください。25個までのテキストブロックに制限します。
-    各テキストブロックには 'label' フィールドにそのテキストの内容を含め、'box_2d' フィールドに位置情報を含めてください。
+    全てのテキストブロックのバウンディングボックスをJSONアレイとして返してください。コードフェンスやマスクは含めないでください。
+    各テキストブロックには 'label' フィールドにそのテキストの内容を含め、'box_2d' フィールドに位置情報を含めてください。隣のテキストブロックとは","で必ず区切ってください。
     位置情報は [y1, x1, y2, x2] の形式で、座標は1000で正規化されています（0から1000の範囲）。
+"""
+
+
+ocr_extraction_system_instructions = """
+    これらのドキュメントページからすべてのテキストコンテンツを抽出してください。
+
+    テーブルの場合：
+    1. マークダウンテーブル形式を使用してテーブル構造を維持
+    2. すべての列ヘッダーと行ラベルを保持
+    3. 数値データが正確にキャプチャされていることを確認
+
+    マルチカラムレイアウトの場合：
+    1. 左から右へ列を処理
+    2. 異なる列のコンテンツを明確に区別
+
+    チャートやグラフの場合：
+    1. チャートのタイプを説明
+    2. 可視の軸ラベル、凡例、データポイントを抽出
+    3. タイトルやキャプションを抽出
+
+    特に注意すべき点：
+    1. すべての数値の正確な転記を確認（最優先事項）
+    2. +, -, ±などの数値の前の記号
+    3. ()の中の文字と数値
+    4. テーブルや文中に存在する正式な物件名と関連金額
+
+    すべての見出し、フッター、ページ番号、脚注を維持してください。
 """
 
 def parse_json(json_output):
@@ -40,7 +63,26 @@ def parse_json(json_output):
             json_output = "\n".join(lines[i+1:])  # "```json"の前のすべてを削除
             json_output = json_output.split("```")[0]  # 閉じる"```"後のすべてを削除
             break
-    return json_output
+    
+    # JSONをパースしてみる
+    try:
+        # 有効なJSONかどうか確認
+        parsed_json = json.loads(json_output)
+        return json_output
+    except json.JSONDecodeError as e:
+        print(f"JSON解析エラー: {e}。修正を試みます...")
+        
+        # よくあるJSON形式エラーを修正
+        # 余分なカンマを削除
+        json_output = json_output.replace(",]", "]").replace(",}", "}")
+        
+        # 再度試行
+        try:
+            parsed_json = json.loads(json_output)
+            return json_output
+        except json.JSONDecodeError:
+            print("JSON修正に失敗しました。空の配列を返します。")
+            return "[]"
 
 def pdf_to_images(pdf_path, output_folder, dpi=600):
     # ディレクトリ作成
@@ -101,33 +143,72 @@ def extract_text_with_pytesseract(image):
     text = pytesseract.image_to_string(image, config=custom_config)
     return text
 
+def extract_page_number(image_path):
+    """画像ファイルパスからページ番号を抽出する"""
+    # ファイル名のパターン：test_page_X.jpg からXを抽出
+    match = re.search(r'test_page_(\d+)\.jpg', image_path)
+    if match:
+        return int(match.group(1))
+    # ファイル名からページ番号を抽出できない場合はファイルパスの順序で推測
+    return None
+
 def detect_text_boxes(image_paths):
     """ドキュメント内のテキストのバウンディングボックスを検出する"""
-    images = [Image.open(path) for path in image_paths]
+    all_text_boxes = []
     
-    prompt = "ドキュメント内のすべてのテキストブロックを検出し、各ブロックのテキスト内容とその位置を返してください。"
+    # ファイル名とページ番号の対応マップを作成
+    page_number_map = {}
+    for i, path in enumerate(image_paths):
+        page_num = extract_page_number(path)
+        if page_num is None:
+            page_num = i + 1  # ファイル名から抽出できなければデフォルトで順番を使用
+        page_number_map[path] = page_num
     
-    response = model.generate_content(
-        prompt,
-        *images,
-        system_instruction=text_detection_system_instructions,
-        temperature=0.2,
-    )
+    # 各ページごとに処理
+    for image_path in image_paths:
+        image = Image.open(image_path)
+        page_num = page_number_map[image_path]
+        
+        prompt = "この画像内のすべてのテキストブロックを検出し、各ブロックのテキスト内容とその位置を返してください。"
+        
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt, image],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                system_instruction=text_detection_system_instructions,
+            ),
+        )
+        
+        # JSONをパース
+        try:
+            parsed_json = parse_json(response.text)
+            text_boxes = json.loads(parsed_json)
+            # 検出されたボックスに正しいページ番号を設定
+            for box in text_boxes:
+                box["page"] = page_num
+            all_text_boxes.extend(text_boxes)
+            print(f"ページ{page_num}から{len(text_boxes)}個のテキストボックスを検出しました")
+        except json.JSONDecodeError as e:
+            print(f"ページ{page_num}のJSONデコードエラー: {e}")
+            print(f"受信したテキスト: {response.text}")
     
-    # JSONをパース
-    try:
-        text_boxes = json.loads(parse_json(response.text))
-        return text_boxes
-    except json.JSONDecodeError as e:
-        print(f"JSONデコードエラー: {e}")
-        print(f"受信したテキスト: {response.text}")
-        return []
+    return all_text_boxes
 
-def ocr_with_gemini(image_paths, instruction):
+def ocr_with_gemini(image_paths):
     """geminiでの画像処理（pytesseractの結果も利用）"""
     print(f"画像のパス：{image_paths}")
     images = [Image.open(path) for path in image_paths]
     print(images)
+    
+    # ファイル名からページ番号を抽出
+    page_numbers = {}
+    for path in image_paths:
+        page_num = extract_page_number(path)
+        if page_num is None:
+            # ファイル名から抽出できない場合はリストの順序を使用
+            page_num = image_paths.index(path) + 1
+        page_numbers[path] = page_num
     
     # pytesseractを使用して事前にテキストを抽出
     pytesseract_results = []
@@ -140,8 +221,6 @@ def ocr_with_gemini(image_paths, instruction):
     
     # 通常のテキスト抽出
     prompt = f"""
-    {instruction}
-
     これは PDF ドキュメントのページです。構造を維持しながら、すべてのテキストコンテンツを抽出してください。
     テーブル、列、見出し、および構造化されたコンテンツに特に注意を払ってください。
     段落の区切りと書式を維持してください。
@@ -155,8 +234,15 @@ def ocr_with_gemini(image_paths, instruction):
     最終的な出力は、画像の内容を正確に反映し、適切にフォーマットされたものにしてください。
     """
 
-    response = model.generate_content([prompt, *images, instruction])
-    # テキストが長すぎてエラーが出た時は、process_large_pdfを実行
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[prompt, *images],           # put prompt + images in one list
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            system_instruction=ocr_extraction_system_instructions,
+        ),
+    )
+    
     print(f"抽出されたテキスト：{response}")
     
     # テキストのバウンディングボックスも検出
@@ -195,7 +281,7 @@ def ocr_complex_document(image_paths):
     すべての見出し、フッター、ページ番号、脚注を維持してください。
     """
     
-    return ocr_with_gemini(image_paths, instruction)
+    return ocr_with_gemini(image_paths)
 
 # でっかいドキュメントを処理する
 def process_large_pdf(pdf_path, output_folder, output_file, output_boxes_file):
@@ -210,17 +296,26 @@ def process_large_pdf(pdf_path, output_folder, output_file, output_boxes_file):
     
     for i, batch in enumerate(batches):
         print(f"現在の処理中のバッチ：{i+1}")
+        
+        # バッチ内の各ファイルからページ番号を抽出
+        batch_page_info = []
+        for path in batch:
+            page_num = extract_page_number(path)
+            if page_num is None:
+                # ファイル名から抽出できない場合はリストの順序を使用
+                page_num = image_paths.index(path) + 1
+            batch_page_info.append(f"ページ{page_num}")
+        
+        batch_page_str = "、".join(batch_page_info)
+        print(f"処理中のページ：{batch_page_str}")
+        
         special_instruction = "すべてのテキストを抽出し、ドキュメント構造を維持"
-        result = ocr_with_gemini(batch, special_instruction)
+        result = ocr_complex_document(batch)
         batch_text = result["extracted_text"]
         text_boxes = result["text_boxes"]
         
-        # ページ番号を追加
-        for box in text_boxes:
-            box["page"] = i + 1
-        
         all_text_boxes.extend(text_boxes)
-        full_text += f"\n\n--- バッチ {i+1} ---\n\n{batch_text}"
+        full_text += f"\n\n--- バッチ {i+1} ({batch_page_str}) ---\n\n{batch_text}"
     
     # 全テキストの保存
     with open(output_file, "w", encoding='utf-8') as f:
@@ -243,11 +338,25 @@ def normalize_doc(extracted_text):
     元の抽出されたテキスト：
     """
 
-    response = model.generate_content(prompt + extracted_text)
+    # ここでテキスト正規化用の専用インストラクションを使用
+    normalize_instruction = """
+    テキストの正規化と整形を行います。バッチ処理マーカーを削除し、文書構造を統一してください。
+    テーブル形式が壊れている場合は修復し、段落の連続性を保ってください。
+    JSONではなく、整形されたテキストとして出力してください。
+    """
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[prompt + extracted_text],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            system_instruction=normalize_instruction,
+        ),
+    )
     print(f"正規化プロセスの回答：{response}")
     return response.text
 
-def visualize_text_boxes(image_path, text_boxes, output_path=None):
+def visualize_text_boxes(image_path, text_boxes, output_path=None, page_num=None):
     """検出されたテキストボックスを視覚化する"""
     # 画像の読み込み
     image = Image.open(image_path)
@@ -256,7 +365,7 @@ def visualize_text_boxes(image_path, text_boxes, output_path=None):
     # フォントを設定（使用可能なフォントがない場合はテキストのみ表示）
     try:
         # 日本語フォントがあればそれを使用
-        font = ImageFont.truetype("Arial.ttf", 15)
+        font = ImageFont.truetype("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 15) # OSのフォントを使用するため自身でフォントを指定してください！
     except IOError:
         font = None
     
@@ -266,8 +375,14 @@ def visualize_text_boxes(image_path, text_boxes, output_path=None):
         "#FFA500", "#800080", "#008000", "#800000", "#008080", "#000080"
     ]
     
+    # ページ番号が指定されている場合は、そのページのボックスのみをフィルタリング
+    if page_num is not None:
+        filtered_boxes = [box for box in text_boxes if box.get("page", 1) == page_num]
+    else:
+        filtered_boxes = text_boxes
+    
     # 各テキストボックスを描画
-    for i, box in enumerate(text_boxes):
+    for i, box in enumerate(filtered_boxes):
         # box_2dのフォーマットは [y1, x1, y2, x2]
         if "box_2d" in box:
             # 正規化された座標を実際の画像サイズに変換
@@ -289,8 +404,21 @@ def visualize_text_boxes(image_path, text_boxes, output_path=None):
             # テキストラベルを描画（可能な場合）
             label = box.get("label", "")
             if label and font:
+                # 現在のPILバージョンに合わせたテキストサイズ取得方法
+                try:
+                    # PILの新しいバージョン
+                    text_bbox = draw.textbbox((0, 0), label, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                except AttributeError:
+                    # 古いPILバージョン向け互換性維持
+                    try:
+                        text_width, text_height = draw.textsize(label, font=font)
+                    except:
+                        # サイズ取得に失敗した場合のフォールバック
+                        text_width, text_height = 100, 15
+                
                 # 背景付きでテキストを描画
-                text_width, text_height = draw.textsize(label, font=font)
                 draw.rectangle([x1, y1 - text_height - 2, x1 + text_width, y1], fill=color)
                 draw.text((x1, y1 - text_height - 2), label, fill="white", font=font)
             elif label:
@@ -300,17 +428,17 @@ def visualize_text_boxes(image_path, text_boxes, output_path=None):
     # 結果を保存または表示
     if output_path:
         image.save(output_path)
-        print(f"視覚化画像を保存しました: {output_path}")
+        print(f"✅視覚化画像を保存しました: {output_path}")
     
     return image
 
 # main関数を拡張して視覚化機能を追加
 def main():
-    pdf_path = "./data/raw_pdf/luxscape.pdf" # 処理するPDFのパス
+    pdf_path = "./data/raw_pdf/C＆Mコーポレーション.pdf" # 処理するPDFのパス
     output_folder = "./data/output_images" # 画像を保存するディレクトリ
-    output_file = "./data/content/luxscape.txt" # 抽出したテキストを保存するファイル
-    output_file_normalized = "./data/content/luxscape_normalized.txt" # 正規化したテキストを保存するファイル
-    output_boxes_file = "./data/content/luxscape_text_boxes.json" # テキストの位置情報を保存するファイル
+    output_file = "./data/content/C＆Mコーポレーション.txt" # 抽出したテキストを保存するファイル
+    output_file_normalized = "./data/content/C＆Mコーポレーション_normalized.txt" # 正規化したテキストを保存するファイル
+    output_boxes_file = "./data/content/9GATES_text_boxes.json" # テキストの位置情報を保存するファイル
     visualized_output_folder = "./data/visualized_images" # 視覚化画像を保存するディレクトリ
 
     # 視覚化出力用ディレクトリの作成
@@ -347,12 +475,16 @@ def main():
             if page <= len(image_paths):
                 image_path = image_paths[page-1]
                 output_viz_path = os.path.join(visualized_output_folder, f"visualized_page_{page}.jpg")
-                visualize_text_boxes(image_path, boxes, output_viz_path)
+                visualize_text_boxes(image_path, boxes, output_viz_path, page)
     else:
         # 少ないページ数の場合は直接処理
+        
+        # テキストボックスをページごとに検出
+        text_boxes = detect_text_boxes(image_paths)
+        
+        # OCRを使用してテキストを抽出
         result = ocr_complex_document(image_paths)
         extracted_text = result["extracted_text"]
-        text_boxes = result["text_boxes"]
         
         # テキストを保存
         with open(output_file, "w", encoding='utf-8') as f:
@@ -364,8 +496,9 @@ def main():
         
         # 各ページを視覚化
         for i, image_path in enumerate(image_paths):
-            output_viz_path = os.path.join(visualized_output_folder, f"visualized_page_{i+1}.jpg")
-            visualize_text_boxes(image_path, text_boxes, output_viz_path)
+            page_num = i + 1
+            output_viz_path = os.path.join(visualized_output_folder, f"visualized_page_{page_num}.jpg")
+            visualize_text_boxes(image_path, text_boxes, output_viz_path, page_num)
 
     # テキストの正規化
     normalized_text = normalize_doc(extracted_text)
