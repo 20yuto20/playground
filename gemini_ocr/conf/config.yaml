@@ -1,0 +1,33 @@
+model:
+  api_key_env: "GEMINI_API_KEY"
+  name: "models/gemini-2.5-pro-preview-03-25"
+  temperature: 0.0
+
+pdf:
+  mode: "single"  # "single" または "directory"
+  path: "/Users/yutokohata/estie_repo/playground/gemini_ocr/data/raw_pdf/luxscape.pdf"
+  directory: "./data/raw_pdf/"
+  dpi: 600
+
+output:
+  images_folder: "output_images" 
+  content_folder: "content"
+  visualized_folder: "visualized_images"
+  
+image_processing:
+  auto_rotate: true
+  enhance_contrast: true
+  gaussian_blur: 
+    kernel_size: [5, 5]
+    sigma: 0
+  contrast:
+    alpha: 1.5
+    beta: 0
+
+ocr:
+  batch_size: 10
+  pytesseract_config: "--oem 3 --psm 6 -l jpn"
+  
+font:
+  path: "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"
+  size: 15
